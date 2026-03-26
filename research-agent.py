@@ -1,10 +1,10 @@
-
 import json
-import sqlite3                          # <-- STEP 1: import stdlib sqlite3
+import sqlite3
 from datetime import datetime
 from typing import Annotated
-from dotenv import load_dotenv   # ← ADD THIS
-load_dotenv() 
+from dotenv import load_dotenv
+load_dotenv()
+
 # ── LangChain core ────────────────────────────────────────────────────────────
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_core.tools import tool
@@ -24,7 +24,7 @@ from langchain_community.utilities import (
 # ── LangGraph ─────────────────────────────────────────────────────────────────
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.checkpoint.sqlite import SqliteSaver  # <-- STEP 2: import SqliteSaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command, interrupt
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -35,7 +35,7 @@ from typing_extensions import TypedDict
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. RESEARCH TOOLS  (unchanged from base agent)
+# 1. RESEARCH TOOLS
 # ══════════════════════════════════════════════════════════════════════════════
 
 ddgs_wrapper = DuckDuckGoSearchAPIWrapper(max_results=5)
@@ -238,31 +238,10 @@ def route_after_agent(state: AgentState) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6. GRAPH CONSTRUCTION  ← SqliteSaver goes HERE, inside build_graph()
+# 6. GRAPH CONSTRUCTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_graph(llm_with_tools, db_path: str = "research_agent_pro.db"):
-    """
-    Build and compile the HITL LangGraph.
-
-    SqliteSaver placement
-    ─────────────────────
-    Rule: create it AFTER the StateGraph is fully wired, BEFORE compile().
-
-      builder = StateGraph(...)      ← 1. define graph structure
-      builder.add_node(...)          ← 2. add all nodes
-      builder.add_edge(...)          ← 3. add all edges
-
-      conn = sqlite3.connect(...)    ← 4. open DB connection  ✅ HERE
-      checkpointer = SqliteSaver(conn)   ← 5. wrap in SqliteSaver  ✅ HERE
-
-      graph = builder.compile(       ← 6. compile — pass checkpointer in
-          checkpointer=checkpointer,
-          interrupt_before=["hitl"],
-      )
-    """
-
-    # ── 1-3: Graph structure ──────────────────────────────────────────────────
     builder = StateGraph(AgentState)
 
     builder.add_node("agent",        lambda state: agent_node(state, llm_with_tools))
@@ -278,22 +257,9 @@ def build_graph(llm_with_tools, db_path: str = "research_agent_pro.db"):
     builder.add_edge("hitl",         "execute_tool")
     builder.add_edge("execute_tool", "agent")
 
-    # ── 4-5: SqliteSaver ─────────────────────────────────────────────────────
-    #
-    #   sqlite3.connect() arguments:
-    #     "research_agent_pro.db"  → filename, created automatically if absent
-    #     check_same_thread=False  → required because LangGraph may access the
-    #                                connection from worker threads
-    #
-    conn = sqlite3.connect(db_path, check_same_thread=False)  # <── HERE
-    checkpointer = SqliteSaver(conn)                           # <── HERE
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    checkpointer = SqliteSaver(conn)
 
-    # ── 6: Compile ────────────────────────────────────────────────────────────
-    #
-    #   interrupt_before=["hitl"]  → pause graph execution BEFORE the hitl
-    #                                node runs; LangGraph saves state to the
-    #                                SqliteSaver checkpoint at this point
-    #
     graph = builder.compile(
         checkpointer=checkpointer,
         interrupt_before=["hitl"],
@@ -302,16 +268,16 @@ def build_graph(llm_with_tools, db_path: str = "research_agent_pro.db"):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7. STREAMING HELPER
+# 7. STREAMING — with proper HITL interrupt-resume loop
 # ══════════════════════════════════════════════════════════════════════════════
 
-def stream_response(graph, query: str, config: dict) -> None:
-    print()
-    for chunk in graph.stream(
-        {"messages": [HumanMessage(content=query)]},
-        config=config,
-        stream_mode="values",
-    ):
+def _stream_until_interrupt(graph, inputs, config: dict) -> bool:
+    """
+    Stream graph until it finishes OR hits an interrupt (HITL gate).
+    Returns True  → graph paused at interrupt, human decision needed.
+    Returns False → graph finished, final answer delivered.
+    """
+    for chunk in graph.stream(inputs, config=config, stream_mode="values"):
         last = chunk["messages"][-1]
         if isinstance(last, AIMessage):
             if last.content:
@@ -319,6 +285,52 @@ def stream_response(graph, query: str, config: dict) -> None:
             elif last.tool_calls:
                 names = [tc["name"] for tc in last.tool_calls]
                 print(f"\n⚙️   Selecting tool(s): {names}")
+
+    # state.next is non-empty only when graph is interrupted mid-run
+    state = graph.get_state(config)
+    return bool(state.next)
+
+
+def run_query(graph, query: str, config: dict) -> None:
+    """
+    Full HITL execution loop for one user query:
+      1. Send query  → stream → may interrupt at HITL gate
+      2. Show tool call → human approves / edits / rejects
+      3. Resume graph with Command(resume=decision) → stream again
+      4. Repeat until no more interrupts → final answer shown
+    """
+    print()
+
+    # ── Step 1: initial run ───────────────────────────────────────────────────
+    interrupted = _stream_until_interrupt(
+        graph,
+        {"messages": [HumanMessage(content=query)]},
+        config,
+    )
+
+    # ── Steps 2-4: HITL approval loop ────────────────────────────────────────
+    while interrupted:
+        state    = graph.get_state(config)
+        last_msg = state.values["messages"][-1]
+
+        # Read the pending tool call from the checkpointed state
+        if not getattr(last_msg, "tool_calls", None):
+            break
+
+        tool_call = last_msg.tool_calls[0]
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+
+        # Show HITL prompt — human decides
+        _display_tool_call(tool_name, tool_args)
+        decision = _get_human_decision(tool_name, tool_args)
+
+        # Resume graph from checkpoint with decision
+        interrupted = _stream_until_interrupt(
+            graph,
+            Command(resume=decision),
+            config,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -330,6 +342,7 @@ BANNER = """
 ║          RESEARCH AGENT PRO  —  HITL Edition             ║
 ║   Human-in-the-Loop  ·  SqliteSaver  ·  LangGraph        ║
 ╠══════════════════════════════════════════════════════════╣
+║  Model  : gpt-oss:20b  (Ollama)                          ║
 ║  Tools  : DuckDuckGo · Wikipedia · arXiv · DateTime      ║
 ║  Control: [A]pprove / [E]dit / [R]eject every tool call  ║
 ║  State  : persisted to research_agent_pro.db             ║
@@ -339,10 +352,11 @@ BANNER = """
 
 def main():
     print(BANNER)
-    llm = ChatOllama(model="minimax-m2.5:cloud", temperature=0)
+
+    llm = ChatOllama(model="gpt-oss:20b-cloud", temperature=0)
     llm_with_tools = llm.bind_tools(TOOLS)
 
-    graph  = build_graph(llm_with_tools)            # SqliteSaver created here
+    graph  = build_graph(llm_with_tools)
     config = {"configurable": {"thread_id": "research-pro-session-1"}}
 
     while True:
@@ -359,7 +373,7 @@ def main():
             break
 
         try:
-            stream_response(graph, query, config)
+            run_query(graph, query, config)
         except Exception as err:
             print(f"\n⚠️  Error: {err}")
 
